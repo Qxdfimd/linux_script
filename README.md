@@ -30,21 +30,21 @@ bash <(curl -Ls https://raw.githubusercontent.com/Qxdfimd/linux_script/refs/head
 ```
 
 ## 申请IP证书
-支持 HTTP-01  
-HTTP-01   - standalone   (自动监听80端口)  
-          - webroot     (使用网站根目录)  
 支持 IPv4单栈 / IPv6单栈 / 双栈  
+支持 HTTP-01  
+HTTP-01   - standalone   （自动监听80端口）  
+          - webroot     （使用网站根目录）  
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/Qxdfimd/linux_script/refs/heads/main/ip_cert.sh)
 ```
 
-## 申请域名证书
-支持 HTTP-01 / DNS-01  
-HTTP-01   - standalone   (自动监听80端口)  
-          - webroot     (使用网站根目录)  
-DNS-01    - Cloudflare   (自动添加TXT记录)  
-          - 手动模式     (手动添加TXT记录)  
+## 申请域名证书  
 支持 IPv4单栈 / IPv6单栈 / 双栈  
+支持 HTTP-01 / DNS-01  
+HTTP-01   - standalone   （自动监听80端口）  
+          - webroot     （使用网站根目录）  
+DNS-01    - Cloudflare   （自动添加TXT记录）  
+          - 手动模式     （手动添加TXT记录）  
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/Qxdfimd/linux_script/refs/heads/main/domain_cert.sh)
 ```
