@@ -23,7 +23,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Qxdfimd/linux_script/refs/head
 ```
 
 ## 设置ZRAM & SWAP  
-设置ZRAM & SWAP为RAM:ZRAM:SWAP = 1:1:1  
+设置为RAM:ZRAM:SWAP = 1:1:1  
 ZRAM算法顺序 zstd>lz4hc>lzo-rle>lz4>lzo  
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/Qxdfimd/linux_script/refs/heads/main/zram_swap.sh)
