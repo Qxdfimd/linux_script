@@ -25,6 +25,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Qxdfimd/linux_script/refs/head
 ## 设置ZRAM & SWAP  
 设置为RAM:ZRAM:SWAP = 1:1:1  
 ZRAM算法顺序 zstd>lz4hc>lzo-rle>lz4>lzo  
+容器/受限环境自动降级：modprobe 不可用时通过 hot_add 复用或重建 zram；实在无法创建则自动改用 2×RAM 的 swapfile  
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/Qxdfimd/linux_script/refs/heads/main/zram_swap.sh)
 ```

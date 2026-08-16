@@ -2,7 +2,8 @@
 # ═══════════════════════════════════════════════════════════════
 # zram_swap.sh — 跨发行版 ZRAM + swapfile 自动配置脚本
 # 自动识别包管理器并安装依赖
-# 流程: 显示当前配置 → 清理旧配置 → 全新设置 → 展示结果
+# 流程: 显示当前配置 → 检测 ZRAM 支持 → 清理旧配置 → 全新设置 → 展示结果
+# 容器/受限环境: modprobe 失败时自动降级（保留已有 zram 或用 hot_add 重建，实在不行改用 2×RAM swapfile）
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -26,6 +27,7 @@ else
 fi
 
 SWAPFILE="/swapfile"
+ZRAM_OK=0   # 1=可使用 zram；0=不可用（容器/内核不支持）
 
 # =============================================================================
 # 1. 自动检测包管理器并安装缺失依赖
@@ -120,17 +122,21 @@ cleanup_old() {
     # 关闭所有 swap
     $SUDO swapoff -a 2>/dev/null || true
 
-    # 移除所有 zram 设备
-    local z dev
-    for z in /sys/block/zram*; do
-        [[ -e "$z" ]] || continue
-        dev="/dev/${z##*/}"
-        $SUDO swapoff "$dev" 2>/dev/null || true
-        if command -v zramctl >/dev/null 2>&1; then
-            $SUDO zramctl -r "$dev" 2>/dev/null || true
-        fi
-        echo 1 | $SUDO tee "$z/reset" >/dev/null 2>&1 || true
-    done
+    # 移除所有 zram 设备（仅当之后能重建时才移除，避免容器里删了无法重建）
+    if [[ "$ZRAM_OK" == 1 ]]; then
+        local z dev
+        for z in /sys/block/zram*; do
+            [[ -e "$z" ]] || continue
+            dev="/dev/${z##*/}"
+            $SUDO swapoff "$dev" 2>/dev/null || true
+            if command -v zramctl >/dev/null 2>&1; then
+                $SUDO zramctl -r "$dev" 2>/dev/null || true
+            fi
+            echo 1 | $SUDO tee "$z/reset" >/dev/null 2>&1 || true
+        done
+    else
+        warn "当前环境无法重建 zram，保留现有 zram 设备不删除"
+    fi
 
     # 删除脚本创建的 swapfile
     if [[ -e "$SWAPFILE" ]]; then
@@ -170,33 +176,49 @@ check_disk() {
     local required_mb=$((mem_mb * 2))
     local available_mb
     available_mb=$(df -m / | awk 'NR==2 {print $4}')
-    info "根目录可用: $((available_mb/1024)) GB，需要: $((required_mb/1024)) GB"
+    info "根目录可用: ${available_mb} MB，需要: ${required_mb} MB"
     if [[ "$available_mb" -lt "$required_mb" ]]; then
-        die "磁盘空间不足！至少需要 $((required_mb/1024)) GB"
+        die "磁盘空间不足！至少需要 ${required_mb} MB"
     fi
 }
 
 # =============================================================================
 # 5. 检测压缩算法
 # =============================================================================
-detect_algo() {
-    info "检测 ZRAM 压缩算法..."
-    $SUDO modprobe zram 2>/dev/null || true
-    if [[ ! -e /sys/block/zram0 ]]; then
-        die "无法加载 zram 模块，请确认内核支持（可尝试 modprobe zram）"
+detect_zram() {
+    info "检测 ZRAM 支持..."
+    ZRAM_OK=0
+    if $SUDO modprobe zram 2>/dev/null; then
+        ZRAM_OK=1
+    elif [[ -d /sys/module/zram || -e /sys/class/zram-control || -e /sys/block/zram0 ]]; then
+        ZRAM_OK=1
+        warn "modprobe 不可用（容器环境常见），但 zram 模块已就绪，直接使用"
     fi
 
-    local algos a
-    algos=$(cat /sys/block/zram0/comp_algorithm 2>/dev/null || echo "")
-    algo=""
-    for a in zstd lz4hc lzo-rle lz4 lzo; do
-        if echo "$algos" | grep -qw "$a"; then
-            algo="$a"
-            break
+    if [[ "$ZRAM_OK" == 1 ]]; then
+        # 确保有设备可读取压缩算法（容器内 modprobe 失败时用 hot_add 创建设备）
+        if [[ ! -e /sys/block/zram0 ]] && [[ -e /sys/class/zram-control ]]; then
+            echo 1 | $SUDO tee /sys/class/zram-control/hot_add >/dev/null 2>&1 || true
         fi
-    done
-    [[ -z "$algo" ]] && { warn "未找到常用算法，使用 lzo"; algo="lzo"; }
-    info "选用的压缩算法: $algo"
+        if [[ -e /sys/block/zram0 ]]; then
+            local algos a
+            algos=$(cat /sys/block/zram0/comp_algorithm 2>/dev/null || echo "")
+            algo=""
+            for a in zstd lz4hc lzo-rle lz4 lzo; do
+                if echo "$algos" | grep -qw "$a"; then
+                    algo="$a"
+                    break
+                fi
+            done
+            [[ -z "$algo" ]] && { warn "未找到常用算法，使用 lzo"; algo="lzo"; }
+            info "选用的压缩算法: $algo"
+        else
+            ZRAM_OK=0
+            warn "zram 模块存在但无法创建设备，将仅使用 swapfile（2×RAM）"
+        fi
+    else
+        warn "无法加载 zram 模块（容器或内核不支持），将仅使用 swapfile（2×RAM）"
+    fi
 }
 
 # =============================================================================
@@ -234,19 +256,41 @@ EOF
 # 7. 创建 ZRAM（直接操作 /sys，不依赖 zramctl）
 # =============================================================================
 setup_zram() {
+    [[ "$ZRAM_OK" == 1 ]] || { warn "跳过 ZRAM（当前环境不支持）"; return 0; }
     info "创建 ZRAM（${mem_mb} MB）"
     $SUDO modprobe -r zram 2>/dev/null || true
     $SUDO modprobe zram 2>/dev/null || true
 
+    # 确保 zram0 设备存在（容器内 modprobe 失败时用 hot_add 创建）
+    if [[ ! -e /sys/block/zram0 ]] && [[ -e /sys/class/zram-control ]]; then
+        echo 1 | $SUDO tee /sys/class/zram-control/hot_add >/dev/null 2>&1 || true
+    fi
+
     local zdev="/sys/block/zram0"
-    [[ -e "$zdev" ]] || die "zram0 不存在"
+    if [[ ! -e "$zdev" ]]; then
+        warn "无法创建 zram0 设备，降级为仅使用 swapfile（2×RAM）"
+        ZRAM_OK=0
+        return 0
+    fi
     echo 1 | $SUDO tee "$zdev/reset" >/dev/null 2>&1 || true
-    echo $((mem_mb * 1024 * 1024)) | $SUDO tee "$zdev/disksize" >/dev/null
+    echo $((mem_mb * 1024 * 1024)) | $SUDO tee "$zdev/disksize" >/dev/null 2>&1 || {
+        warn "无法设置 zram 大小（sysfs 只读？），降级为仅使用 swapfile（2×RAM）"
+        ZRAM_OK=0
+        return 0
+    }
     if [[ -w "$zdev/comp_algorithm" ]]; then
         echo "$algo" | $SUDO tee "$zdev/comp_algorithm" >/dev/null 2>&1 || true
     fi
-    $SUDO mkswap /dev/zram0 >/dev/null 2>&1
-    $SUDO swapon /dev/zram0 -p 100 2>/dev/null || $SUDO swapon /dev/zram0
+    if ! $SUDO mkswap /dev/zram0 >/dev/null 2>&1; then
+        warn "mkswap zram0 失败，降级为仅使用 swapfile（2×RAM）"
+        ZRAM_OK=0
+        return 0
+    fi
+    if ! $SUDO swapon /dev/zram0 -p 100 2>/dev/null && ! $SUDO swapon /dev/zram0 2>/dev/null; then
+        warn "启用 ZRAM 失败，降级为仅使用 swapfile（2×RAM）"
+        ZRAM_OK=0
+        return 0
+    fi
     info "ZRAM 已启用（${mem_mb} MB，优先级 100）"
 }
 
@@ -254,16 +298,21 @@ setup_zram() {
 # 8. 创建 swapfile（兼容 btrfs / fallocate 不可用）
 # =============================================================================
 setup_swapfile() {
-    info "创建 swapfile（${mem_mb} MB）"
+    local swap_mb="$mem_mb"
+    if [[ "$ZRAM_OK" != 1 ]]; then
+        swap_mb=$((mem_mb * 2))
+        warn "ZRAM 不可用，swapfile 自动扩容为 2×RAM（${swap_mb} MB）"
+    fi
+    info "创建 swapfile（${swap_mb} MB）"
     local fs_type
     fs_type=$(df -T / | awk 'NR==2 {print $2}')
     if [[ "$fs_type" == "btrfs" ]]; then
         warn "btrfs 文件系统：使用 dd 创建并设置 no CoW"
         $SUDO chattr +C "$SWAPFILE" 2>/dev/null || true
-        $SUDO dd if=/dev/zero of="$SWAPFILE" bs=1M count="$mem_mb"
+        $SUDO dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mb"
     else
-        $SUDO fallocate -l "${mem_mb}M" "$SWAPFILE" 2>/dev/null \
-            || $SUDO dd if=/dev/zero of="$SWAPFILE" bs=1M count="$mem_mb"
+        $SUDO fallocate -l "${swap_mb}M" "$SWAPFILE" 2>/dev/null \
+            || $SUDO dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mb"
     fi
     $SUDO chmod 600 "$SWAPFILE"
     $SUDO mkswap "$SWAPFILE" >/dev/null 2>&1
@@ -279,6 +328,8 @@ setup_swapfile() {
 # 9. ZRAM 持久化（自动适配 init 系统）
 # =============================================================================
 persist_zram() {
+    [[ "$ZRAM_OK" == 1 ]] || { warn "ZRAM 不可用，跳过持久化"; return 0; }
+
     # systemd
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
         $SUDO tee /usr/local/bin/zram-swap-setup.sh >/dev/null <<EOF
@@ -286,10 +337,11 @@ persist_zram() {
 case "\$1" in
     start)
         modprobe zram 2>/dev/null || true
+        [ -e /sys/block/zram0 ] || echo 1 > /sys/class/zram-control/hot_add 2>/dev/null || true
         echo $((mem_mb * 1024 * 1024)) > /sys/block/zram0/disksize
         echo "$algo" > /sys/block/zram0/comp_algorithm 2>/dev/null || true
         mkswap /dev/zram0 >/dev/null 2>&1
-        swapon /dev/zram0 -p 100 2>/dev/null || swapon /dev/zram0
+        swapon /dev/zram0 -p 100 2>/dev/null || swapon /dev/zram0 2>/dev/null || true
         ;;
     stop)
         swapoff /dev/zram0 2>/dev/null || true
@@ -323,10 +375,11 @@ EOF
         $SUDO tee /etc/local.d/zram-swap.start >/dev/null <<EOF
 #!/bin/sh
 modprobe zram 2>/dev/null || true
+[ -e /sys/block/zram0 ] || echo 1 > /sys/class/zram-control/hot_add 2>/dev/null || true
 echo $((mem_mb * 1024 * 1024)) > /sys/block/zram0/disksize
 echo "$algo" > /sys/block/zram0/comp_algorithm 2>/dev/null || true
 mkswap /dev/zram0 >/dev/null 2>&1
-swapon /dev/zram0 -p 100 2>/dev/null || swapon /dev/zram0
+swapon /dev/zram0 -p 100 2>/dev/null || swapon /dev/zram0 2>/dev/null || true
 EOF
         $SUDO tee /etc/local.d/zram-swap.stop >/dev/null <<'EOF'
 #!/bin/sh
@@ -346,10 +399,11 @@ EOF
         $SUDO tee -a /etc/rc.local >/dev/null <<EOF
 # ZRAM swap 配置
 modprobe zram 2>/dev/null || true
+[ -e /sys/block/zram0 ] || echo 1 > /sys/class/zram-control/hot_add 2>/dev/null || true
 echo $((mem_mb * 1024 * 1024)) > /sys/block/zram0/disksize
 echo "$algo" > /sys/block/zram0/comp_algorithm 2>/dev/null || true
 mkswap /dev/zram0 >/dev/null 2>&1
-swapon /dev/zram0 -p 100 2>/dev/null || swapon /dev/zram0
+swapon /dev/zram0 -p 100 2>/dev/null || swapon /dev/zram0 2>/dev/null || true
 EOF
         $SUDO chmod +x /etc/rc.local 2>/dev/null || true
         info "已写入 /etc/rc.local 持久化"
@@ -362,11 +416,13 @@ EOF
 show_result() {
     echo ""
     step "配置完成"
-    info "--- ZRAM 设备 ---"
-    if command -v zramctl >/dev/null 2>&1; then
-        zramctl
-    else
-        cat /sys/block/zram0/comp_algorithm 2>/dev/null || true
+    if [[ "$ZRAM_OK" == 1 ]]; then
+        info "--- ZRAM 设备 ---"
+        if command -v zramctl >/dev/null 2>&1; then
+            zramctl
+        else
+            cat /sys/block/zram0/comp_algorithm 2>/dev/null || true
+        fi
     fi
     info "--- Swap 设备 ---"
     swapon --show 2>/dev/null || swapon -s
@@ -412,9 +468,9 @@ show_sysinfo() {
 main() {
     install_deps
     show_current
+    detect_zram
     cleanup_old
     check_disk
-    detect_algo
     write_sysctl
     setup_zram
     setup_swapfile
